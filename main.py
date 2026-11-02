@@ -27,7 +27,7 @@ else:
     # اگر در محیط تعریف نشده بود، لیست خالی نباشد تا برنامه کرش نکند
     GEMINI_KEYS = []
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 app = FastAPI()
 
 @app.get("/")
