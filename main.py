@@ -21,12 +21,12 @@ CONFIG = {
         k.strip() for k in os.getenv("GEMINI_KEYS", "").split(",") if k.strip()
     ],
     "DEBUG_CHAT_ID": os.getenv("DEBUG_CHAT_ID", ""),
-    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
     "TRANSLATE_TO": os.getenv("TRANSLATE_TO", "fa"),
 }
 
 TELEGRAM_API = f"https://api.telegram.org/bot{CONFIG['BOT_TOKEN']}"
-CAPTION_MAX = 980   # حاشیه امن برای سقف ۱۰۲۴ کاراکتری تلگرام
+CAPTION_MAX = 850   # حاشیه امن تضمینی همراه با تگ‌های HTML برای سقف ۱۰۲۴ کاراکتری تلگرام
 MSG_MAX = 3800      # حاشیه امن برای سقف ۴۰۹۶ کاراکتری تلگرام
 ZWNJ = "\u200c"     # نیم‌فاصله استاندارد یونیکد
 
@@ -368,9 +368,6 @@ async def ai_transcribe_audio(client: httpx.AsyncClient, audio_path: str, dbg: O
 def esc(s: str) -> str:
     return html.escape(str(s or ""), quote=False)
 
-def vlen(h: str) -> int:
-    return len(re.sub(r'<[^>]*>', '', str(h or '')).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').replace('&quot;', '"'))
-
 def balance_markdown(chunk: str, rest: str) -> Tuple[str, str]:
     stars = len(re.findall(r'\*\*', chunk))
     if stars % 2 != 0:
@@ -439,7 +436,7 @@ def build_containers(sections: List[Dict[str, Any]], has_media_caption: bool) ->
             continue
 
         if sec.get("isRawHtml"):
-            item_len = vlen(sec["text"])
+            item_len = len(sec["text"])
             sep = 2 if current_blocks else 0
             if current_len + sep + item_len > limit and current_blocks:
                 flush()
@@ -452,7 +449,7 @@ def build_containers(sections: List[Dict[str, Any]], has_media_caption: bool) ->
 
         while remaining_text:
             sep = 2 if current_blocks else 0
-            label_len = len(current_label) + 2 if current_label else 0
+            label_len = len(current_label) + 40 if current_label else 0
             available = limit - current_len - sep - label_len
 
             if available < 120 and current_blocks:
@@ -462,13 +459,13 @@ def build_containers(sections: List[Dict[str, Any]], has_media_caption: bool) ->
             if len(remaining_text) <= available:
                 block_html = format_section_block(current_label, remaining_text)
                 current_blocks.append(block_html)
-                current_len += sep + label_len + vlen(md_to_html(remaining_text))
+                current_len += sep + len(block_html)
                 remaining_text = ""
             else:
                 chunk, rest = split_at_word(remaining_text, available)
                 block_html = format_section_block(current_label, chunk)
                 current_blocks.append(block_html)
-                current_len += sep + label_len + vlen(md_to_html(chunk))
+                current_len += sep + len(block_html)
                 remaining_text = rest
                 if current_label and not current_label.endswith("(cont.)"):
                     current_label += " (cont.)"
@@ -498,6 +495,64 @@ def build_footer(info: dict, post_url: str, lang: str, target: str, translated: 
     lines.append(f"<b>Time Tehran:</b> {dt['shamsi']}")
     lines.append(f"<b>Processing:</b> {total_sec:.1f}s")
     return "\n" + "\n".join(lines)
+
+# ======================= ارسال ایمن مدیا به تلگرام =======================
+async def send_video_robust(
+    client: httpx.AsyncClient,
+    chat_id: int,
+    video_path: str,
+    thumb_path: Optional[str],
+    caption: str = "",
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    duration: Optional[int] = None
+) -> Tuple[bool, httpx.Response]:
+    data = {
+        "chat_id": chat_id,
+        "supports_streaming": "true"
+    }
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
+    if width:
+        data["width"] = width
+    if height:
+        data["height"] = height
+    if duration:
+        data["duration"] = duration
+
+    # تلاش اول: ارسال با کپشن و تامبنیل
+    with open(video_path, "rb") as vf:
+        files = {"video": (os.path.basename(video_path), vf, "video/mp4")}
+        if thumb_path and os.path.exists(thumb_path):
+            with open(thumb_path, "rb") as tf:
+                files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+                resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
+        else:
+            resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
+
+    if resp.status_code == 200:
+        return True, resp
+
+    # تلاش دوم (در صورت رد شدن کپشن توسط تلگرام): ارسال فایل بدون کپشن
+    fallback_data = {
+        "chat_id": chat_id,
+        "supports_streaming": "true"
+    }
+    if width: fallback_data["width"] = width
+    if height: fallback_data["height"] = height
+    if duration: fallback_data["duration"] = duration
+
+    with open(video_path, "rb") as vf:
+        files = {"video": (os.path.basename(video_path), vf, "video/mp4")}
+        if thumb_path and os.path.exists(thumb_path):
+            with open(thumb_path, "rb") as tf:
+                files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+                resp_retry = await client.post(f"{TELEGRAM_API}/sendVideo", data=fallback_data, files=files, timeout=300.0)
+        else:
+            resp_retry = await client.post(f"{TELEGRAM_API}/sendVideo", data=fallback_data, files=files, timeout=300.0)
+
+    return False, resp_retry
 
 # ======================= چرخه کامل دانلود، پردازش و ارسال =======================
 async def process_and_send(chat_id: int, url: str):
@@ -551,12 +606,11 @@ async def process_and_send(chat_id: int, url: str):
             cmd_thumb = f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 -vf "scale=\'if(gt(a,1),320,-2)\':\'if(gt(a,1),-2,320)\'" -q:v 2 "{thumb_path}"'
             subprocess.run(cmd_thumb, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # ۳. استخراج صوت با فرمت خالص WAV (PCM 16-bit 16kHz) بدون نیاز به انکودر خارجی
+            # ۳. استخراج صوت با فرمت خالص WAV (PCM 16-bit 16kHz)
             await dbg.step("FFmpeg Extract Audio WAV")
             cmd_audio = f'ffmpeg -y -i "{downloaded_file}" -vn -c:a pcm_s16le -ar 16000 -ac 1 "{audio_path}"'
-            res = subprocess.run(cmd_audio, shell=True, capture_output=True, text=True)
+            subprocess.run(cmd_audio, shell=True, capture_output=True, text=True)
             if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 500:
-                # تلاش مجدد با دستور منعطف‌تر
                 cmd_alt = f'ffmpeg -y -i "{downloaded_file}" -vn -ar 16000 -ac 1 "{audio_path}"'
                 subprocess.run(cmd_alt, shell=True, capture_output=True, text=True)
 
@@ -604,11 +658,11 @@ async def process_and_send(chat_id: int, url: str):
                     await update_status("در حال ترجمه کپشن پست اینستاگرام...")
                     tr_caption = await translate_markdown(client, raw_caption, cap_lang, target, dbg)
 
-            # ۷. ساخت بخش‌های پیام (ترنسکریپت در ابتدا و کپشن پس از آن)
+            # ۷. ساخت بخش‌های پیام
             await dbg.step("Build Message Sections")
             sections: List[Dict[str, Any]] = []
 
-            # الف) بلاک‌های مربوط به صوت ویدیو
+            # صوت ویدیو
             if extracted_text:
                 if tr_transcript:
                     sections.append({"label": "🗣 ترجمه ترنسکریپت (فارسی):", "text": tr_transcript})
@@ -616,7 +670,7 @@ async def process_and_send(chat_id: int, url: str):
                 else:
                     sections.append({"label": "🎙 متن ترنسکریپت صوت:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
 
-            # ب) بلاک‌های مربوط به کپشن اینستاگرام
+            # کپشن اینستاگرام
             if raw_caption:
                 if tr_caption:
                     sections.append({"label": "📝 ترجمه کپشن اینستاگرام:", "text": tr_caption})
@@ -624,7 +678,7 @@ async def process_and_send(chat_id: int, url: str):
                 else:
                     sections.append({"label": "📄 کپشن اینستاگرام:", "text": raw_caption})
 
-            # ج) فوتر نهایی
+            # فوتر نهایی
             elapsed = (datetime.datetime.now() - t0).total_seconds()
             footer_html = build_footer(info, url, lang if extracted_text else "none", target, bool(tr_transcript or tr_caption), elapsed)
             sections.append({"label": "", "text": footer_html, "isRawHtml": True})
@@ -634,37 +688,26 @@ async def process_and_send(chat_id: int, url: str):
             caption_for_media = containers[0] if containers else ""
             remaining_messages = containers[1:] if len(containers) > 1 else []
 
-            # ۹. آپلود و ارسال ویدیو
+            # ۹. آپلود و ارسال ویدیو به صورت ایمن
             await dbg.step("Upload Video to Telegram")
             await update_status("در حال آپلود و ارسال ویدیو به تلگرام...")
-            with open(downloaded_file, "rb") as vf:
-                files = {"video": (os.path.basename(downloaded_file), vf, "video/mp4")}
-                tf = open(thumb_path, "rb") if os.path.exists(thumb_path) else None
-                if tf:
-                    files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+            
+            success_with_caption, _ = await send_video_robust(
+                client=client,
+                chat_id=chat_id,
+                video_path=downloaded_file,
+                thumb_path=thumb_path,
+                caption=caption_for_media,
+                width=info.get('width'),
+                height=info.get('height'),
+                duration=int(info['duration']) if info.get('duration') else None
+            )
 
-                data = {
-                    "chat_id": chat_id,
-                    "caption": caption_for_media,
-                    "parse_mode": "HTML",
-                    "supports_streaming": "true"
-                }
-                if info.get('width'):
-                    data["width"] = info['width']
-                if info.get('height'):
-                    data["height"] = info['height']
-                if info.get('duration'):
-                    data["duration"] = int(info['duration'])
+            # اگر ارسال با کپشن ناموفق بود و ویدیو خام ارسال شد، کل متن‌ها به صورت پیام متنی ارسال می‌شوند
+            if not success_with_caption:
+                remaining_messages = containers
 
-                send_resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
-                if tf:
-                    tf.close()
-
-                if send_resp.status_code != 200:
-                    await client.post(f"{TELEGRAM_API}/sendVideo", data={"chat_id": chat_id, "supports_streaming": "true"}, files=files, timeout=300.0)
-                    remaining_messages = containers
-
-            # ۱۰. ارسال پیام‌های تکمیلی در صورت طولانی بودن متن
+            # ۱۰. ارسال پیام‌های تکمیلی
             for extra_msg in remaining_messages:
                 await client.post(f"{TELEGRAM_API}/sendMessage", json={
                     "chat_id": chat_id,
