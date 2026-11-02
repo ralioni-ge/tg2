@@ -215,12 +215,14 @@ def lang_name(code: str) -> str:
     }
     return mapping.get(c, c)
 
+ZWNJ = "\u200c"
+
 def normalize_fa(t: str) -> str:
     if not t:
         return ""
     t = t.replace('\u064A', '\u06CC').replace('\u0643', '\u06A9')
-    t = re.sub(r'(^|\s)(ن?می) (?=[\u0600-\u06FF])', r'\1\2\u200c', t)
-    t = re.sub(r'([\u0600-\u06FF]) ها(?=$|[\s.,،؟?!؛:])', r'\1\u200cها', t)
+    t = re.sub(r'(^|\s)(ن?می) (?=[\u0600-\u06FF])', r'\g<1>\g<2>' + ZWNJ, t)
+    t = re.sub(r'([\u0600-\u06FF]) ها(?=$|[\s.,،؟?!؛:])', r'\g<1>' + ZWNJ + 'ها', t)
     return t.strip()
 
 def g2j(gy: int, gm: int, gd: int) -> Tuple[int, int, int]:
