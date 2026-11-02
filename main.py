@@ -4,12 +4,12 @@ import uuid
 import html
 import asyncio
 import threading
+import subprocess
 import httpx
 import yt_dlp
 import uvicorn
 from fastapi import FastAPI
 
-# وب‌سرور برای زنده نگه داشتن سرور در رندر
 app = FastAPI()
 
 @app.get("/")
@@ -27,17 +27,39 @@ async def send_msg(client, chat_id, text):
 
 def format_caption(info, post_url):
     raw_caption = info.get('description', '') or info.get('title', '')
-    uploader = info.get('uploader') or info.get('uploader_id') or ""
-    display_name = info.get('channel') or uploader or ""
+    
+    # تفکیک دقیق نام نمایشی و آیدی انگلیسی
+    cand_id = info.get('uploader_id') or ""
+    cand_uploader = info.get('uploader') or ""
+    cand_channel = info.get('channel') or ""
 
+    username = ""
+    display_name = ""
+
+    # بررسی اینکه کدام مقدار حاوی آیدی استاندارد (بدون ایموجی و فاصله) است
+    if re.match(r'^[a-zA-Z0-9._]+$', cand_id):
+        username = cand_id
+        display_name = cand_uploader or cand_channel or cand_id
+    elif re.match(r'^[a-zA-Z0-9._]+$', cand_uploader):
+        username = cand_uploader
+        display_name = cand_channel or cand_id or cand_uploader
+    else:
+        username = cand_id or cand_uploader
+
+    if not display_name:
+        display_name = username
+
+    # ۱. خط لینک پست اینستاگرام
     link_line = f'🔗 <a href="{post_url}">Instagram Link</a>'
+    
+    # ۲. خط مشخصات سازنده (هایپرلینک فقط روی آیدی انگلیسی)
     user_line = ""
-    if uploader:
-        user_url = f"https://instagram.com/{uploader}"
-        if display_name and display_name.lower() != uploader.lower():
-            user_line = f"👤 {html.escape(display_name)} (<a href=\"{user_url}\">@{html.escape(uploader)}</a>)"
+    if username:
+        user_url = f"https://instagram.com/{username}"
+        if display_name and display_name.strip() != username.strip():
+            user_line = f"👤 {html.escape(display_name)} (<a href=\"{user_url}\">@{html.escape(username)}</a>)"
         else:
-            user_line = f"👤 <a href=\"{user_url}\">@{html.escape(uploader)}</a>"
+            user_line = f"👤 <a href=\"{user_url}\">@{html.escape(username)}</a>"
 
     footer = f"\n\n{link_line}"
     if user_line:
@@ -51,10 +73,11 @@ def format_caption(info, post_url):
 
 async def process_and_send(chat_id, url):
     async with httpx.AsyncClient(timeout=300.0) as client:
-        await send_msg(client, chat_id, "⏳ در حال دانلود ویدیو از اینستاگرام...")
+        await send_msg(client, chat_id, "⏳ در حال دانلود و بهینه‌سازی ویدیو...")
         
         unique_id = str(uuid.uuid4())[:8]
         output_template = f"/tmp/{unique_id}_%(id)s.%(ext)s"
+        thumb_path = f"/tmp/{unique_id}_thumb.jpg"
 
         ydl_opts = {
             'outtmpl': output_template,
@@ -75,11 +98,31 @@ async def process_and_send(chat_id, url):
                 
                 caption = format_caption(info, url)
 
+            # ۱. ساخت خودکار تامبنیل با کیفیت از ثانیه ۰.۵ ویدیو برای حذف تصویر سیاه
+            cmd = f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 -vf "scale=320:-2" -q:v 2 "{thumb_path}"'
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # ۲. آماده‌سازی فایل‌ها برای ارسال
             with open(downloaded_file, "rb") as vf:
                 filename = os.path.basename(downloaded_file)
                 files = {"video": (filename, vf, "video/mp4")}
-                data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+                
+                tf = None
+                if os.path.exists(thumb_path):
+                    tf = open(thumb_path, "rb")
+                    files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+
+                data = {
+                    "chat_id": chat_id,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                    "supports_streaming": "true"  # فعال‌سازی استریم و پیش‌نمایش فوری در تلگرام
+                }
+                
                 await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
+
+                if tf:
+                    tf.close()
 
         except Exception as e:
             await send_msg(client, chat_id, f"❌ خطا: {str(e)}")
@@ -87,6 +130,11 @@ async def process_and_send(chat_id, url):
             if downloaded_file and os.path.exists(downloaded_file):
                 try:
                     os.remove(downloaded_file)
+                except Exception:
+                    pass
+            if os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)
                 except Exception:
                     pass
 
@@ -124,7 +172,6 @@ async def telegram_worker():
 def run_bot():
     asyncio.run(telegram_worker())
 
-# اجرای بات تلگرام در پس‌زمینه
 threading.Thread(target=run_bot, daemon=True).start()
 
 if __name__ == "__main__":
