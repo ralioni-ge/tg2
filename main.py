@@ -28,7 +28,6 @@ async def send_msg(client, chat_id, text):
 def format_caption(info, post_url):
     raw_caption = info.get('description', '') or info.get('title', '')
     
-    # تفکیک دقیق نام نمایشی و آیدی انگلیسی
     cand_id = info.get('uploader_id') or ""
     cand_uploader = info.get('uploader') or ""
     cand_channel = info.get('channel') or ""
@@ -36,7 +35,6 @@ def format_caption(info, post_url):
     username = ""
     display_name = ""
 
-    # بررسی اینکه کدام مقدار حاوی آیدی استاندارد (بدون ایموجی و فاصله) است
     if re.match(r'^[a-zA-Z0-9._]+$', cand_id):
         username = cand_id
         display_name = cand_uploader or cand_channel or cand_id
@@ -49,10 +47,8 @@ def format_caption(info, post_url):
     if not display_name:
         display_name = username
 
-    # ۱. خط لینک پست اینستاگرام
     link_line = f'🔗 <a href="{post_url}">Instagram Link</a>'
     
-    # ۲. خط مشخصات سازنده (هایپرلینک فقط روی آیدی انگلیسی)
     user_line = ""
     if username:
         user_url = f"https://instagram.com/{username}"
@@ -97,12 +93,21 @@ async def process_and_send(chat_id, url):
                     downloaded_file = f"{base}.mp4"
                 
                 caption = format_caption(info, url)
+                
+                # استخراج ابعاد و طول واقعی ویدیو
+                video_width = info.get('width')
+                video_height = info.get('height')
+                duration = int(info.get('duration') or 0)
 
-            # ۱. ساخت خودکار تامبنیل با کیفیت از ثانیه ۰.۵ ویدیو برای حذف تصویر سیاه
-            cmd = f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 -vf "scale=320:-2" -q:v 2 "{thumb_path}"'
+            # ساخت تامبنیل بدون دفرمه شدن:
+            # اگر افقی باشد عرض ۳۲۰ می‌شود، اگر عمودی باشد ارتفاع ۳۲۰ می‌شود (سقف مجاز تلگرام حفظ می‌شود)
+            cmd = (
+                f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 '
+                f'-vf "scale=\'if(gt(a,1),320,-2)\':\'if(gt(a,1),-2,320)\'" -q:v 2 "{thumb_path}"'
+            )
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # ۲. آماده‌سازی فایل‌ها برای ارسال
+            # ارسال ویدیو به تلگرام با ابعاد دقیق
             with open(downloaded_file, "rb") as vf:
                 filename = os.path.basename(downloaded_file)
                 files = {"video": (filename, vf, "video/mp4")}
@@ -116,8 +121,16 @@ async def process_and_send(chat_id, url):
                     "chat_id": chat_id,
                     "caption": caption,
                     "parse_mode": "HTML",
-                    "supports_streaming": "true"  # فعال‌سازی استریم و پیش‌نمایش فوری در تلگرام
+                    "supports_streaming": "true"
                 }
+
+                # اضافه کردن ابعاد دقیق برای جلوگیری از دفرمه شدن پلیر
+                if video_width:
+                    data["width"] = video_width
+                if video_height:
+                    data["height"] = video_height
+                if duration:
+                    data["duration"] = duration
                 
                 await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
 
@@ -159,21 +172,4 @@ async def telegram_worker():
                         if not chat_id or not text:
                             continue
 
-                        if text == "/start":
-                            await send_msg(client, chat_id, "سلام! ربات فعال است. لینک ریلز بفرستید.")
-                            continue
-
-                        match = re.search(r"https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/[a-zA-Z0-9_\-]+", text)
-                        if match:
-                            asyncio.create_task(process_and_send(chat_id, match.group(0)))
-            except Exception:
-                await asyncio.sleep(2)
-
-def run_bot():
-    asyncio.run(telegram_worker())
-
-threading.Thread(target=run_bot, daemon=True).start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+     
