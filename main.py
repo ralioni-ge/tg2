@@ -6,6 +6,7 @@ import base64
 import asyncio
 import datetime
 import zoneinfo
+import subprocess
 from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
@@ -20,7 +21,7 @@ CONFIG = {
         k.strip() for k in os.getenv("GEMINI_KEYS", "").split(",") if k.strip()
     ],
     "DEBUG_CHAT_ID": os.getenv("DEBUG_CHAT_ID", ""),
-    "GEMINI_MODEL": "gemini-3.5-flash-lite",  # استفاده اختصاصی از مدل نسل جدید
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
     "TRANSLATE_TO": os.getenv("TRANSLATE_TO", "fa"),
 }
 
@@ -33,7 +34,7 @@ app = FastAPI()
 
 @app.get("/")
 def health_check():
-    return {"status": "Bot is running 24/7 with gemini-3.5-flash-lite!"}
+    return {"status": "Bot is running 24/7!"}
 
 # ======================= ابزارهای کمکی لاگ و دیباگ =======================
 class DebugLogger:
@@ -108,7 +109,7 @@ class DebugLogger:
         self.lines.append(f"🏁 finished in {self._el()}" if ok else f"🛑 stopped after {self._el()}")
         await self._flush()
 
-# ======================= مدیریت کلیدها و ارتباط با Gemini 3.5 =======================
+# ======================= مدیریت کلیدها و ارتباط با Gemini =======================
 gemini_key_index = 0
 def get_next_gemini_key() -> Optional[str]:
     global gemini_key_index
@@ -142,51 +143,55 @@ async def gemini_generate(
     if system_instruction:
         body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
-    model = CONFIG["GEMINI_MODEL"]
-    max_attempts = len(keys) * 2
+    models_to_try = [CONFIG["GEMINI_MODEL"], "gemini-1.5-flash", "gemini-2.0-flash"]
     last_err = None
 
-    for attempt in range(1, max_attempts + 1):
-        api_key = get_next_gemini_key()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        try:
-            t_start = datetime.datetime.now()
-            resp = await client.post(url, json=body, timeout=75.0)
+    for model in dict.fromkeys(models_to_try):
+        max_attempts = len(keys) * 2
+        for attempt in range(1, max_attempts + 1):
+            api_key = get_next_gemini_key()
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            try:
+                t_start = datetime.datetime.now()
+                resp = await client.post(url, json=body, timeout=60.0)
 
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                    if dbg:
+                        await dbg.err(f"{label} (Key ...{api_key[-6:]})", last_err)
+                    await asyncio.sleep(1.0 * attempt)
+                    continue
+
+                if resp.status_code == 404:
+                    break
+
+                if resp.status_code != 200:
+                    last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                    if dbg:
+                        await dbg.err(f"{label} error", last_err)
+                    break
+
+                data = resp.json()
+                cand = data.get("candidates", [{}])[0]
+                p_list = cand.get("content", {}).get("parts", [])
+                out = "".join(p.get("text", "") for p in p_list).strip()
+
+                if not out:
+                    why = data.get("promptFeedback", {}).get("blockReason") or cand.get("finishReason") or "empty"
+                    raise ValueError(f"خروجی هوش مصنوعی خالی بود: {why}")
+
+                dur = (datetime.datetime.now() - t_start).total_seconds()
                 if dbg:
-                    await dbg.err(f"{label} (Key ...{api_key[-6:]})", last_err)
-                await asyncio.sleep(1.0 * attempt)
-                continue
+                    await dbg.note(f"{label}: موفق · {len(out)} کاراکتر · {dur:.1f}s")
+                return out
 
-            if resp.status_code != 200:
-                last_err = Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                last_err = e
                 if dbg:
-                    await dbg.err(f"{label} error", last_err)
-                break
+                    await dbg.err(f"{label} attempt {attempt}", e)
+                await asyncio.sleep(0.8)
 
-            data = resp.json()
-            cand = data.get("candidates", [{}])[0]
-            p_list = cand.get("content", {}).get("parts", [])
-            out = "".join(p.get("text", "") for p in p_list).strip()
-
-            if not out:
-                why = data.get("promptFeedback", {}).get("blockReason") or cand.get("finishReason") or "empty"
-                raise ValueError(f"خروجی هوش مصنوعی خالی بود: {why}")
-
-            dur = (datetime.datetime.now() - t_start).total_seconds()
-            if dbg:
-                await dbg.note(f"{label}: موفق · {len(out)} کاراکتر · {dur:.1f}s")
-            return out
-
-        except Exception as e:
-            last_err = e
-            if dbg:
-                await dbg.err(f"{label} attempt {attempt}", e)
-            await asyncio.sleep(0.8)
-
-    raise last_err or Exception("ارتباط با gemini-3.5-flash-lite با تمام کلیدها ناموفق بود.")
+    raise last_err or Exception("ارتباط با جمینای با تمام کلیدها ناموفق بود.")
 
 # ======================= تشخیص زبان، تقویم و نرمال‌سازی =======================
 def detect_lang(text: str) -> str:
@@ -243,7 +248,7 @@ def fmt_dates(unix_ts: float) -> Dict[str, str]:
     shamsi = f"{jy:04d}-{jm:02d}-{jd:02d} {d_teh.strftime('%H:%M:%S')}"
     return {"iso": iso, "shamsi": shamsi}
 
-# ======================= موتور ترجمه و ترنسکریپت مستقیم ویدیو =======================
+# ======================= موتور ترجمه و اصلاح ترنسکریپت =======================
 def translation_system_prompt(src: str, dst: str) -> str:
     lines = [
         "You are a master literary and professional translator.",
@@ -277,6 +282,26 @@ async def translate_markdown(client: httpx.AsyncClient, md: str, src: str, dst: 
         out = normalize_fa(out)
     return out.strip()
 
+def gemini_spell_prompt(lang: str) -> str:
+    lines = [
+        f"You are an expert editor of speech-to-text transcripts in {lang_name(lang)}.",
+        "Task: Fix audio recognition, phonetic, and punctuation errors based on context.",
+        "Do NOT summarize, expand, or paraphrase.",
+        "Output ONLY the corrected transcript."
+    ]
+    if is_persian(lang):
+        lines.append("Use standard Persian letters ی و ک, and apply proper ZWNJ (نیم‌فاصله). Maintain a standard written style.")
+    return "\n".join(lines)
+
+async def ai_spell(client: httpx.AsyncClient, text: str, lang: str, dbg: Optional[DebugLogger]) -> str:
+    sys = gemini_spell_prompt(lang)
+    parts = [{"text": text}]
+    try:
+        out = await gemini_generate(client, parts, system_instruction=sys, max_tokens=8192, temperature=0.1, label="spellcheck", dbg=dbg)
+        return normalize_fa(out) if is_persian(lang) else out
+    except Exception:
+        return text
+
 async def ai_generate_title(client: httpx.AsyncClient, text: str, lang: str, dbg: Optional[DebugLogger]) -> str:
     fallback = " ".join(text.split()[:6]) + "…"
     prompt = "Generate a concise title (3-8 words) in the SAME LANGUAGE. Output ONLY the title."
@@ -304,31 +329,32 @@ async def ai_format(client: httpx.AsyncClient, text: str, dbg: Optional[DebugLog
     except Exception:
         return {"title": "", "body": text, "formatted": False}
 
-# ترنسکریپت مستقیم ویدیو بدون نیاز به تبدیل به ویس با gemini-3.5-flash-lite
-async def ai_transcribe_video_direct(client: httpx.AsyncClient, video_path: str, dbg: Optional[DebugLogger]) -> str:
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
+# ======================= ترنسکریپت اختصاصی صوت با Gemini =======================
+async def ai_transcribe_audio(client: httpx.AsyncClient, audio_path: str, dbg: Optional[DebugLogger]) -> str:
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
 
-    if len(video_bytes) < 1000:
+    if len(audio_bytes) < 500:
         return ""
 
-    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
     prompt = (
-        "Listen to the speech in this video carefully and transcribe all spoken words verbatim in their original language. "
-        "Do not summarize or describe visuals. Output ONLY the exact transcribed speech. "
+        "Listen to this audio carefully and transcribe all spoken words verbatim in their original language. "
+        "Do not summarize or paraphrase. Output ONLY the exact transcribed text. "
         "If there is completely no speech (only background music, silence, or noise), reply with: NO_SPEECH"
     )
     parts = [
         {"text": prompt},
-        {"inlineData": {"mimeType": "video/mp4", "data": video_b64}}
+        {"inlineData": {"mimeType": "audio/wav", "data": audio_b64}}
     ]
     out = await gemini_generate(
         client,
         parts,
-        system_instruction="You are a professional audio/video speech transcriber. Transcribe spoken words verbatim.",
+        system_instruction="You are a professional audio transcriber. Transcribe spoken words accurately.",
         max_tokens=8192,
         temperature=0.1,
-        label="video-transcribe",
+        label="audio-transcribe",
         dbg=dbg
     )
     clean = out.strip()
@@ -338,7 +364,7 @@ async def ai_transcribe_video_direct(client: httpx.AsyncClient, video_path: str,
         clean = clean.replace("NO_SPEECH", "").strip()
     return clean
 
-# ======================= شکستن هوشمند و ساخت کانتینرها =======================
+# ======================= شکستن هوشمند و قالب‌بندی بدون قطعی (Smart Split) =======================
 def esc(s: str) -> str:
     return html.escape(str(s or ""), quote=False)
 
@@ -450,7 +476,7 @@ def build_containers(sections: List[Dict[str, Any]], has_media_caption: bool) ->
 
     return containers
 
-# ======================= ساخت فوتر =======================
+# ======================= ساخت فوتر کامل =======================
 def build_footer(info: dict, post_url: str, lang: str, target: str, translated: bool, total_sec: float) -> str:
     dt = fmt_dates(datetime.datetime.now().timestamp())
     dur = info.get("duration")
@@ -467,15 +493,15 @@ def build_footer(info: dict, post_url: str, lang: str, target: str, translated: 
     lines.append(f"<b>Sender:</b> <a href=\"{esc(user_url)}\">{esc(cand_name)}</a>")
     lines.append(f"<b>TimeStamp Date:</b> {dt['iso']}")
     lines.append(f"<b>Time Tehran:</b> {dt['shamsi']}")
-    lines.append(f"<b>Model:</b> <code>gemini-3.5-flash-lite</code> ({total_sec:.1f}s)")
+    lines.append(f"<b>Processing:</b> {total_sec:.1f}s")
     return "\n" + "\n".join(lines)
 
-# ======================= ارسال ویدیو (مستقیم با URL بدون آپلود مجدد) =======================
-async def send_video_fast(
+# ======================= سیستم نجات ۴ مرحله‌ای ارسال ویدیو =======================
+async def send_video_robust(
     client: httpx.AsyncClient,
     chat_id: int,
-    direct_video_url: str,
-    local_video_path: str,
+    video_path: str,
+    thumb_path: Optional[str],
     caption: str = "",
     width: Optional[int] = None,
     height: Optional[int] = None,
@@ -483,65 +509,97 @@ async def send_video_fast(
     dbg: Optional[DebugLogger] = None
 ) -> Tuple[bool, Optional[str]]:
     
+    # بررسی حجم فایل برای سقف ۵۰ مگابایت تلگرام
+    actual_video_path = video_path
+    comp_file = None
+    try:
+        file_size = os.path.getsize(video_path)
+        if file_size > 49 * 1024 * 1024:
+            if dbg: await dbg.step("فشرده‌سازی ویدیوی بالای ۵۰ مگابایت")
+            comp_file = f"{video_path}_comp.mp4"
+            cmd_comp = f'ffmpeg -y -i "{video_path}" -c:v libx264 -crf 28 -preset fast -c:a aac -b:a 96k "{comp_file}"'
+            subprocess.run(cmd_comp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(comp_file) and os.path.getsize(comp_file) > 1000:
+                actual_video_path = comp_file
+    except Exception:
+        pass
+
+    # اعتبارسنجی تامبنیل تلگرام (فرمت JPEG، کمتر از ۲۰۰ کیلوبایت)
+    valid_thumb = (
+        thumb_path is not None and 
+        os.path.exists(thumb_path) and 
+        (100 < os.path.getsize(thumb_path) < 200 * 1024)
+    )
+
     base_data = {
         "chat_id": str(chat_id),
         "supports_streaming": "true"
     }
-    if width and int(width) > 0: base_data["width"] = str(int(width))
-    if height and int(height) > 0: base_data["height"] = str(int(height))
-    if duration and int(duration) > 0: base_data["duration"] = str(int(duration))
+    if width and int(width) > 0:
+        base_data["width"] = str(int(width))
+    if height and int(height) > 0:
+        base_data["height"] = str(int(height))
+    if duration and int(duration) > 0:
+        base_data["duration"] = str(int(duration))
 
-    # مرحله ۱: ارسال مستقیم از طریق لینک دانلود بدون آپلود مجدد (بسیار سریع)
-    if direct_video_url:
-        if dbg: await dbg.step("ارسال مستقیم با لینک CDN به تلگرام")
-        payload = dict(base_data)
-        payload["video"] = direct_video_url
-        if caption:
-            payload["caption"] = caption
-            payload["parse_mode"] = "HTML"
+    async def _post_media(endpoint: str, post_data: dict, use_thumb: bool, file_field: str = "video"):
+        with open(actual_video_path, "rb") as vf:
+            files = {file_field: (os.path.basename(actual_video_path), vf, "video/mp4")}
+            if use_thumb and valid_thumb:
+                with open(thumb_path, "rb") as tf:
+                    files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+                    return await client.post(f"{TELEGRAM_API}/{endpoint}", data=post_data, files=files, timeout=300.0)
+            else:
+                return await client.post(f"{TELEGRAM_API}/{endpoint}", data=post_data, files=files, timeout=300.0)
 
-        try:
-            resp = await client.post(f"{TELEGRAM_API}/sendVideo", json=payload, timeout=60.0)
-            if resp.status_code == 200:
-                return True, None
-            if dbg: await dbg.err("ارسال مستقیم با لینک رد شد", resp.text[:200])
-        except Exception as e:
-            if dbg: await dbg.err("خطای اتصال در ارسال با لینک", e)
-
-    # مرحله ۲ (فال‌بک): آپلود فایل محلی در صورت بروز خطا در دریافت مستقیم توسط تلگرام
-    if dbg: await dbg.step("فال‌بک: آپلود مستقیم فایل محلی")
-    data_upload = dict(base_data)
+    # مرحله ۱: ارسال ویدیو همراه با کپشن و تامبنیل
+    data_with_caption = dict(base_data)
     if caption:
-        data_upload["caption"] = caption
-        data_upload["parse_mode"] = "HTML"
+        data_with_caption["caption"] = caption
+        data_with_caption["parse_mode"] = "HTML"
 
+    resp = await _post_media("sendVideo", data_with_caption, use_thumb=True)
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return True, None
+    if dbg: await dbg.err("sendVideo (با کپشن و تامبنیل) شکست خورد", resp.text[:200])
+
+    # مرحله ۲: ارسال ویدیو با کپشن اما بدون تامبنیل (در صورتی که خطای تامبنیل باشد)
+    resp = await _post_media("sendVideo", data_with_caption, use_thumb=False)
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return True, None
+    if dbg: await dbg.err("sendVideo (با کپشن، بدون تامبنیل) شکست خورد", resp.text[:200])
+
+    # مرحله ۳: ارسال ویدیو خام (بدون کپشن و تامبنیل - متن‌ها در پیام بعدی ارسال خواهند شد)
+    resp = await _post_media("sendVideo", base_data, use_thumb=False)
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return False, None
+    if dbg: await dbg.err("sendVideo (ویدیو خام) شکست خورد", resp.text[:200])
+
+    # مرحله ۴: ارسال فایل ویدیو به عنوان داکیومنت (در صورتی که کدک یا ساختار پلیر رد شده باشد)
+    doc_data = {"chat_id": str(chat_id)}
+    resp = await _post_media("sendDocument", doc_data, use_thumb=False, file_field="document")
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return False, None
+    if dbg: await dbg.err("sendDocument شکست خورد", resp.text[:200])
+
+    # اگر تمام ۴ مرحله شکست خورد، خطای دقیق تلگرام را استخراج کن
+    if comp_file and os.path.exists(comp_file): os.remove(comp_file)
     try:
-        with open(local_video_path, "rb") as vf:
-            files = {"video": (os.path.basename(local_video_path), vf, "video/mp4")}
-            resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data_upload, files=files, timeout=300.0)
-
-        if resp.status_code == 200:
-            return True, None
-
-        # تلاش مجدد بدون کپشن (در صورتی که مشکل از طول یا فرمت متن باشد)
-        with open(local_video_path, "rb") as vf:
-            files = {"video": (os.path.basename(local_video_path), vf, "video/mp4")}
-            resp_retry = await client.post(f"{TELEGRAM_API}/sendVideo", data=base_data, files=files, timeout=300.0)
-
-        if resp_retry.status_code == 200:
-            return False, None
-
-        err_desc = resp_retry.json().get("description", resp_retry.text[:200])
-        return False, err_desc
-    except Exception as e:
-        return False, str(e)
+        err_desc = resp.json().get("description", resp.text[:200])
+    except Exception:
+        err_desc = resp.text[:200]
+    return False, err_desc
 
 # ======================= چرخه کامل دانلود، پردازش و ارسال =======================
 async def process_and_send(chat_id: int, url: str):
     async with httpx.AsyncClient(timeout=300.0) as client:
         t0 = datetime.datetime.now()
         dbg = DebugLogger(client, CONFIG["DEBUG_CHAT_ID"], "Instagram Job", chat_id)
-        await dbg.step("Start Job (gemini-3.5-flash-lite)")
+        await dbg.step("Start Job")
 
         status_msg_id = None
         async def update_status(text: str):
@@ -562,12 +620,14 @@ async def process_and_send(chat_id: int, url: str):
 
         uid = str(uuid.uuid4())[:8]
         output_template = f"/tmp/{uid}_%(id)s.%(ext)s"
+        thumb_path = f"/tmp/{uid}_thumb.jpg"
+        audio_path = f"/tmp/{uid}_audio.wav"
         downloaded_file = None
 
         try:
-            # ۱. استخراج اطلاعات و دانلود ویدیو
-            await dbg.step("Download info with yt-dlp")
-            await update_status("در حال دریافت کلیپ اینستاگرام...")
+            # ۱. دانلود ویدیو با yt-dlp
+            await dbg.step("Download with yt-dlp")
+            await update_status("در حال دریافت اطلاعات و دانلود ویدیو از اینستاگرام...")
             ydl_opts = {
                 'outtmpl': output_template,
                 'format': 'bestvideo+bestaudio/best',
@@ -581,17 +641,27 @@ async def process_and_send(chat_id: int, url: str):
             if not os.path.exists(downloaded_file):
                 downloaded_file = f"{os.path.splitext(downloaded_file)[0]}.mp4"
 
-            # لینک مستقیم استریم از CDN اینستاگرام
-            direct_video_url = info.get('url', '')
+            # ۲. ساخت تامبنیل استاندارد
+            await dbg.step("FFmpeg Thumbnail")
+            cmd_thumb = f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 -vf "scale=\'if(gt(a,1),320,-2)\':\'if(gt(a,1),-2,320)\'" -q:v 2 "{thumb_path}"'
+            subprocess.run(cmd_thumb, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # ۲. ترنسکریپت مستقیم ویدیو با gemini-3.5-flash-lite (بدون تبدیل به صوت)
-            await dbg.step("Direct Video Transcription")
-            await update_status("در حال ترنسکریپت مستقیم ویدیو با gemini-3.5-flash-lite...")
+            # ۳. استخراج صوت با فرمت خالص WAV (PCM 16-bit 16kHz)
+            await dbg.step("FFmpeg Extract Audio WAV")
+            cmd_audio = f'ffmpeg -y -i "{downloaded_file}" -vn -c:a pcm_s16le -ar 16000 -ac 1 "{audio_path}"'
+            subprocess.run(cmd_audio, shell=True, capture_output=True, text=True)
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 500:
+                cmd_alt = f'ffmpeg -y -i "{downloaded_file}" -vn -ar 16000 -ac 1 "{audio_path}"'
+                subprocess.run(cmd_alt, shell=True, capture_output=True, text=True)
+
+            # ۴. تبدیل صدا به متن (Speech-to-Text با هوش مصنوعی)
+            await dbg.step("AI Audio Transcription")
+            await update_status("در حال تبدیل صوت به متن (Speech-to-Text با Gemini)...")
             extracted_text = ""
-            if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
-                extracted_text = await ai_transcribe_video_direct(client, downloaded_file, dbg)
+            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+                extracted_text = await ai_transcribe_audio(client, audio_path, dbg)
 
-            # ۳. پردازش متن، ساختاربندی و ترجمه ترنسکریپت
+            # ۵. پردازش متن، ویرایش و ترجمه ترنسکریپت
             lang = detect_lang(extracted_text) if extracted_text else "fa"
             target = CONFIG["TRANSLATE_TO"]
             need_translate = target and (lang != target) and not (is_persian(lang) and is_persian(target))
@@ -600,42 +670,47 @@ async def process_and_send(chat_id: int, url: str):
             tr_transcript = ""
 
             if extracted_text:
-                await dbg.step("Formatting & Title")
-                await update_status("در حال قالب‌بندی و ساختاربندی ترنسکریپت...")
+                if not need_translate:
+                    await dbg.step("AI Spellcheck (Same Language)")
+                    await update_status("در حال بهینه‌سازی و اصلاح ترنسکریپت...")
+                    extracted_text = await ai_spell(client, extracted_text, lang, dbg)
+
+                await dbg.step("AI Formatting & Title")
+                await update_status("در حال ساخت عنوان و ساختاربندی ترنسکریپت...")
                 title_task = ai_generate_title(client, extracted_text, lang, dbg)
                 format_task = ai_format(client, extracted_text, dbg)
                 title, fm = await asyncio.gather(title_task, format_task)
                 fm["title"] = title
 
                 if need_translate:
-                    await dbg.step("Translate Transcript")
-                    await update_status("در حال ترجمه ترنسکریپت به فارسی معیار...")
+                    await dbg.step("AI Translation of Transcript")
+                    await update_status("در حال ترجمه دقیق و روان ترنسکریپت به فارسی معیار...")
                     source_md = f"**{title}**\n\n{fm['body']}"
                     tr_transcript = await translate_markdown(client, source_md, lang, target, dbg)
 
-            # ۴. پردازش و ترجمه کپشن اصلی اینستاگرام
+            # ۶. پردازش و ترجمه کپشن اصلی پست اینستاگرام
             raw_caption = (info.get('description', '') or info.get('title', '') or "").strip()
             tr_caption = ""
             if raw_caption:
                 cap_lang = detect_lang(raw_caption)
                 if target and (cap_lang != target) and not (is_persian(cap_lang) and is_persian(target)):
-                    await dbg.step("Translate Caption")
-                    await update_status("در حال ترجمه کپشن اینستاگرام...")
+                    await dbg.step("Translate Instagram Caption")
+                    await update_status("در حال ترجمه کپشن پست اینستاگرام...")
                     tr_caption = await translate_markdown(client, raw_caption, cap_lang, target, dbg)
 
-            # ۵. ساخت ساختار مرتب پیام
-            await dbg.step("Build Containers")
+            # ۷. ساخت بخش‌های پیام
+            await dbg.step("Build Message Sections")
             sections: List[Dict[str, Any]] = []
 
-            # ترنسکریپت و ترجمه آن
+            # صوت ویدیو
             if extracted_text:
                 if tr_transcript:
                     sections.append({"label": "🗣 ترجمه ترنسکریپت (فارسی):", "text": tr_transcript})
-                    sections.append({"label": "🎙 متن اصلی ترنسکریپت:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
+                    sections.append({"label": "🎙 متن اصلی صوت (Transcript):", "text": f"**{fm['title']}**\n\n{fm['body']}"})
                 else:
-                    sections.append({"label": "🎙 متن ترنسکریپت:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
+                    sections.append({"label": "🎙 متن ترنسکریپت صوت:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
 
-            # کپشن اینستاگرام و ترجمه آن
+            # کپشن اینستاگرام
             if raw_caption:
                 if tr_caption:
                     sections.append({"label": "📝 ترجمه کپشن اینستاگرام:", "text": tr_caption})
@@ -643,24 +718,25 @@ async def process_and_send(chat_id: int, url: str):
                 else:
                     sections.append({"label": "📄 کپشن اینستاگرام:", "text": raw_caption})
 
-            # فوتر
+            # فوتر نهایی
             elapsed = (datetime.datetime.now() - t0).total_seconds()
             footer_html = build_footer(info, url, lang if extracted_text else "none", target, bool(tr_transcript or tr_caption), elapsed)
             sections.append({"label": "", "text": footer_html, "isRawHtml": True})
 
+            # ۸. بسته‌بندی بر اساس محدودیت کاراکتر تلگرام
             containers = build_containers(sections, has_media_caption=True)
             caption_for_media = containers[0] if containers else ""
             remaining_messages = containers[1:] if len(containers) > 1 else []
 
-            # ۶. ارسال فوق‌سریع ویدیو با لینک مستقیم
-            await dbg.step("Fast Send Video")
-            await update_status("در حال ارسال سریع ویدیو به تلگرام...")
+            # ۹. آپلود و ارسال ویدیو با سیستم نجات چندمرحله‌ای
+            await dbg.step("Upload Video to Telegram")
+            await update_status("در حال آپلود و ارسال ویدیو به تلگرام...")
             
-            sent_with_caption, err_msg = await send_video_fast(
+            sent_with_caption, err_msg = await send_video_robust(
                 client=client,
                 chat_id=chat_id,
-                direct_video_url=direct_video_url,
-                local_video_path=downloaded_file,
+                video_path=downloaded_file,
+                thumb_path=thumb_path,
                 caption=caption_for_media,
                 width=info.get('width'),
                 height=info.get('height'),
@@ -668,8 +744,9 @@ async def process_and_send(chat_id: int, url: str):
                 dbg=dbg
             )
 
-            # ۷. ارسال ادامه‌ی پیام‌های متنی در صورت طولانی بودن
+            # ۱۰. ارسال پیام‌های تکمیلی متنی بر اساس وضعیت ویدیو
             if sent_with_caption:
+                # ویدیو همراه با کپشن اصلی فرستاده شد؛ بقیه بخش‌ها را بفرست
                 for extra_msg in remaining_messages:
                     await client.post(f"{TELEGRAM_API}/sendMessage", json={
                         "chat_id": chat_id,
@@ -678,6 +755,7 @@ async def process_and_send(chat_id: int, url: str):
                         "link_preview_options": {"is_disabled": True}
                     }, timeout=30.0)
             elif err_msg is None:
+                # ویدیو به صورت خام با موفقیت ارسال شد؛ تمام متن‌ها را به عنوان پیام‌های متصل بفرست
                 for msg_chunk in containers:
                     await client.post(f"{TELEGRAM_API}/sendMessage", json={
                         "chat_id": chat_id,
@@ -686,9 +764,10 @@ async def process_and_send(chat_id: int, url: str):
                         "link_preview_options": {"is_disabled": True}
                     }, timeout=30.0)
             else:
+                # اگر تلگرام کلاً ارسال فایل را نپذیرفت، خطای تلگرام را به کاربر نشان بده
                 await client.post(f"{TELEGRAM_API}/sendMessage", json={
                     "chat_id": chat_id,
-                    "text": f"⚠️ ویدیو به دلیل خطای تلگرام ارسال نشد:\n<code>{html.escape(err_msg)}</code>",
+                    "text": f"⚠️ ویدیو به دلیل خطای تلگرام ارسال نشد:\n<code>{html.escape(err_msg)}</code>\n\nمتن استخراج‌شده در ادامه ارسال می‌شود:",
                     "parse_mode": "HTML"
                 }, timeout=30.0)
                 for msg_chunk in containers:
@@ -699,7 +778,7 @@ async def process_and_send(chat_id: int, url: str):
                         "link_preview_options": {"is_disabled": True}
                     }, timeout=30.0)
 
-            # حذف پیام موقت وضعیت
+            # ۱۱. حذف پیام وضعیت موقت
             if status_msg_id:
                 await client.post(f"{TELEGRAM_API}/deleteMessage", json={"chat_id": chat_id, "message_id": status_msg_id})
             await dbg.end(True)
@@ -714,11 +793,12 @@ async def process_and_send(chat_id: int, url: str):
                 except Exception:
                     pass
         finally:
-            if downloaded_file and os.path.exists(downloaded_file):
-                try:
-                    os.remove(downloaded_file)
-                except Exception:
-                    pass
+            for p in [downloaded_file, thumb_path, audio_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
 # ======================= حلقه دریافت پیام‌ها (Telegram Worker) =======================
 async def telegram_worker():
