@@ -17,18 +17,18 @@ from fastapi import FastAPI
 # ======================= پیکربندی و توکن‌ها از محیط Render =======================
 CONFIG = {
     "BOT_TOKEN": os.getenv("BOT_TOKEN", "9005346823:AAHe2Pqnx5xJgYNZMHyw2_uTeD93glTshXc"),
-    # خواندن کلیدهای جمینای مستقیماً از متغیر محیطی GEMINI_KEYS در رندر
     "GEMINI_KEYS": [
         k.strip() for k in os.getenv("GEMINI_KEYS", "").split(",") if k.strip()
     ],
     "DEBUG_CHAT_ID": os.getenv("DEBUG_CHAT_ID", ""),
-    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
     "TRANSLATE_TO": os.getenv("TRANSLATE_TO", "fa"),
 }
 
 TELEGRAM_API = f"https://api.telegram.org/bot{CONFIG['BOT_TOKEN']}"
 CAPTION_MAX = 980   # حاشیه امن برای سقف ۱۰۲۴ کاراکتری تلگرام
 MSG_MAX = 3800      # حاشیه امن برای سقف ۴۰۹۶ کاراکتری تلگرام
+ZWNJ = "\u200c"     # نیم‌فاصله استاندارد یونیکد
 
 app = FastAPI()
 
@@ -131,7 +131,7 @@ async def gemini_generate(
 ) -> str:
     keys = [k for k in CONFIG["GEMINI_KEYS"] if k]
     if not keys:
-        raise ValueError("هیچ کلید معتبری برای Gemini تنظیم نشده است.")
+        raise ValueError("هیچ کلید معتبری برای Gemini در متغیرهای محیطی Render یافت نشد.")
 
     body: Dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
@@ -163,7 +163,6 @@ async def gemini_generate(
                     continue
 
                 if resp.status_code == 404:
-                    # اگر مدل در اکانت وجود نداشت، به مدل بعدی در لیست سوییچ کن
                     break
 
                 if resp.status_code != 200:
@@ -214,8 +213,6 @@ def lang_name(code: str) -> str:
         "es": "Spanish", "ru": "Russian", "tr": "Turkish", "it": "Italian"
     }
     return mapping.get(c, c)
-
-ZWNJ = "\u200c"
 
 def normalize_fa(t: str) -> str:
     if not t:
@@ -293,7 +290,7 @@ def gemini_spell_prompt(lang: str) -> str:
         "Output ONLY the corrected transcript."
     ]
     if is_persian(lang):
-        lines.append("Use standard Persian letters ی and ک, and apply proper ZWNJ (نیم‌فاصله). Maintain a standard written style.")
+        lines.append("Use standard Persian letters ی و ک, and apply proper ZWNJ (نیم‌فاصله). Maintain a standard written style.")
     return "\n".join(lines)
 
 async def ai_spell(client: httpx.AsyncClient, text: str, lang: str, dbg: Optional[DebugLogger]) -> str:
@@ -335,21 +332,37 @@ async def ai_format(client: httpx.AsyncClient, text: str, dbg: Optional[DebugLog
 # ======================= ترنسکریپت اختصاصی صوت با Gemini =======================
 async def ai_transcribe_audio(client: httpx.AsyncClient, audio_path: str, dbg: Optional[DebugLogger]) -> str:
     with open(audio_path, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        audio_bytes = f.read()
 
-    sys = (
-        "You are a professional audio transcriber. Transcribe all spoken words verbatim in their original language. "
-        "If there is no speech, or only ambient noise or background music, output exactly: NO_SPEECH. "
-        "Output ONLY the transcript."
+    if len(audio_bytes) < 500:
+        return ""
+
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    prompt = (
+        "Listen to this audio carefully and transcribe all spoken words verbatim in their original language. "
+        "Do not summarize or paraphrase. Output ONLY the exact transcribed text. "
+        "If there is completely no speech (only background music, silence, or noise), reply with: NO_SPEECH"
     )
     parts = [
-        {"inlineData": {"mimeType": "audio/mp3", "data": audio_b64}},
-        {"text": "Transcribe this audio file."}
+        {"text": prompt},
+        {"inlineData": {"mimeType": "audio/wav", "data": audio_b64}}
     ]
-    out = await gemini_generate(client, parts, system_instruction=sys, max_tokens=8192, temperature=0.0, label="audio-transcribe", dbg=dbg)
-    if "NO_SPEECH" in out or len(out.strip()) < 5:
+    out = await gemini_generate(
+        client,
+        parts,
+        system_instruction="You are a professional audio transcriber. Transcribe spoken words accurately.",
+        max_tokens=8192,
+        temperature=0.1,
+        label="audio-transcribe",
+        dbg=dbg
+    )
+    clean = out.strip()
+    if clean.upper() in ["NO_SPEECH", "[NO_SPEECH]", "NO SPEECH", "NO_SPEECH."]:
         return ""
-    return out.strip()
+    if clean.startswith("NO_SPEECH"):
+        clean = clean.replace("NO_SPEECH", "").strip()
+    return clean
 
 # ======================= شکستن هوشمند و قالب‌بندی بدون قطعی (Smart Split) =======================
 def esc(s: str) -> str:
@@ -369,14 +382,12 @@ def split_at_word(text: str, max_len: int) -> Tuple[str, str]:
     if len(text) <= max_len:
         return text, ""
 
-    # ۱. اولویت اول: انتهای پاراگراف
     p_index = text.rfind("\n\n", 0, max_len)
     if p_index >= max_len * 0.4:
         chunk = text[:p_index].strip()
         rest = text[p_index + 2:].strip()
         return balance_markdown(chunk, rest)
 
-    # ۲. اولویت دوم: انتهای جمله
     s_matches = list(re.finditer(r'[.!?؟\n]\s+', text[:max_len]))
     if s_matches:
         last_m = s_matches[-1]
@@ -386,14 +397,12 @@ def split_at_word(text: str, max_len: int) -> Tuple[str, str]:
             rest = text[cut:].strip()
             return balance_markdown(chunk, rest)
 
-    # ۳. اولویت سوم: آخرین فاصله
     sp_index = text.rfind(" ", 0, max_len)
     if sp_index > 0:
         chunk = text[:sp_index].strip()
         rest = text[sp_index + 1:].strip()
         return balance_markdown(chunk, rest)
 
-    # حالت اضطراری
     return balance_markdown(text[:max_len].strip(), text[max_len:].strip())
 
 def md_to_html(s: str) -> str:
@@ -517,7 +526,7 @@ async def process_and_send(chat_id: int, url: str):
         uid = str(uuid.uuid4())[:8]
         output_template = f"/tmp/{uid}_%(id)s.%(ext)s"
         thumb_path = f"/tmp/{uid}_thumb.jpg"
-        audio_path = f"/tmp/{uid}_audio.mp3"
+        audio_path = f"/tmp/{uid}_audio.wav"
         downloaded_file = None
 
         try:
@@ -537,22 +546,28 @@ async def process_and_send(chat_id: int, url: str):
             if not os.path.exists(downloaded_file):
                 downloaded_file = f"{os.path.splitext(downloaded_file)[0]}.mp4"
 
-            # ۲. ساخت تامبنیل استاندارد و استخراج صوت
-            await dbg.step("FFmpeg Thumbnail & Audio Extract")
+            # ۲. ساخت تامبنیل استاندارد
+            await dbg.step("FFmpeg Thumbnail")
             cmd_thumb = f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 -vf "scale=\'if(gt(a,1),320,-2)\':\'if(gt(a,1),-2,320)\'" -q:v 2 "{thumb_path}"'
             subprocess.run(cmd_thumb, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            cmd_audio = f'ffmpeg -y -i "{downloaded_file}" -vn -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k "{audio_path}"'
-            subprocess.run(cmd_audio, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # ۳. استخراج صوت با فرمت خالص WAV (PCM 16-bit 16kHz) بدون نیاز به انکودر خارجی
+            await dbg.step("FFmpeg Extract Audio WAV")
+            cmd_audio = f'ffmpeg -y -i "{downloaded_file}" -vn -c:a pcm_s16le -ar 16000 -ac 1 "{audio_path}"'
+            res = subprocess.run(cmd_audio, shell=True, capture_output=True, text=True)
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 500:
+                # تلاش مجدد با دستور منعطف‌تر
+                cmd_alt = f'ffmpeg -y -i "{downloaded_file}" -vn -ar 16000 -ac 1 "{audio_path}"'
+                subprocess.run(cmd_alt, shell=True, capture_output=True, text=True)
 
-            # ۳. تبدیل صدا به متن (Gemini Multimodal Transcription)
+            # ۴. تبدیل صدا به متن (Speech-to-Text با هوش مصنوعی)
             await dbg.step("AI Audio Transcription")
-            await update_status("در حال تبدیل صوت به متن (Speech-to-Text با هوش مصنوعی)...")
+            await update_status("در حال تبدیل صوت به متن (Speech-to-Text با Gemini)...")
             extracted_text = ""
             if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
                 extracted_text = await ai_transcribe_audio(client, audio_path, dbg)
 
-            # ۴. پردازش متن، ویرایش، پاراگراف‌بندی و ترجمه
+            # ۵. پردازش متن، ویرایش و ترجمه ترنسکریپت
             lang = detect_lang(extracted_text) if extracted_text else "fa"
             target = CONFIG["TRANSLATE_TO"]
             need_translate = target and (lang != target) and not (is_persian(lang) and is_persian(target))
@@ -567,51 +582,59 @@ async def process_and_send(chat_id: int, url: str):
                     extracted_text = await ai_spell(client, extracted_text, lang, dbg)
 
                 await dbg.step("AI Formatting & Title")
-                await update_status("در حال ساخت عنوان و ساختاربندی پاراگراف‌ها...")
+                await update_status("در حال ساخت عنوان و ساختاربندی ترنسکریپت...")
                 title_task = ai_generate_title(client, extracted_text, lang, dbg)
                 format_task = ai_format(client, extracted_text, dbg)
                 title, fm = await asyncio.gather(title_task, format_task)
                 fm["title"] = title
 
                 if need_translate:
-                    await dbg.step("AI Translation to Persian")
-                    await update_status("در حال ترجمه دقیق و روان به فارسی معیار...")
+                    await dbg.step("AI Translation of Transcript")
+                    await update_status("در حال ترجمه دقیق و روان ترنسکریپت به فارسی معیار...")
                     source_md = f"**{title}**\n\n{fm['body']}"
                     tr_transcript = await translate_markdown(client, source_md, lang, target, dbg)
 
-            # ۵. پردازش و ترجمه کپشن اصلی پست اینستاگرام
+            # ۶. پردازش و ترجمه کپشن اصلی پست اینستاگرام
             raw_caption = (info.get('description', '') or info.get('title', '') or "").strip()
             tr_caption = ""
             if raw_caption:
                 cap_lang = detect_lang(raw_caption)
                 if target and (cap_lang != target) and not (is_persian(cap_lang) and is_persian(target)):
                     await dbg.step("Translate Instagram Caption")
+                    await update_status("در حال ترجمه کپشن پست اینستاگرام...")
                     tr_caption = await translate_markdown(client, raw_caption, cap_lang, target, dbg)
 
-            # ۶. ساخت بخش‌های پیام (Sections)
+            # ۷. ساخت بخش‌های پیام (ترنسکریپت در ابتدا و کپشن پس از آن)
             await dbg.step("Build Message Sections")
             sections: List[Dict[str, Any]] = []
 
+            # الف) بلاک‌های مربوط به صوت ویدیو
             if extracted_text:
                 if tr_transcript:
-                    sections.append({"label": "Translation:", "text": tr_transcript})
-                sections.append({"label": "Transcript:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
+                    sections.append({"label": "🗣 ترجمه ترنسکریپت (فارسی):", "text": tr_transcript})
+                    sections.append({"label": "🎙 متن اصلی صوت (Transcript):", "text": f"**{fm['title']}**\n\n{fm['body']}"})
+                else:
+                    sections.append({"label": "🎙 متن ترنسکریپت صوت:", "text": f"**{fm['title']}**\n\n{fm['body']}"})
 
+            # ب) بلاک‌های مربوط به کپشن اینستاگرام
             if raw_caption:
                 if tr_caption:
-                    sections.append({"label": "Caption Translation:", "text": tr_caption})
-                sections.append({"label": "Original Caption:", "text": raw_caption})
+                    sections.append({"label": "📝 ترجمه کپشن اینستاگرام:", "text": tr_caption})
+                    sections.append({"label": "📄 کپشن اصلی اینستاگرام:", "text": raw_caption})
+                else:
+                    sections.append({"label": "📄 کپشن اینستاگرام:", "text": raw_caption})
 
+            # ج) فوتر نهایی
             elapsed = (datetime.datetime.now() - t0).total_seconds()
             footer_html = build_footer(info, url, lang if extracted_text else "none", target, bool(tr_transcript or tr_caption), elapsed)
             sections.append({"label": "", "text": footer_html, "isRawHtml": True})
 
-            # ۷. شکستن هوشمند بر اساس محدودیت تلگرام
+            # ۸. بسته‌بندی بر اساس محدودیت کاراکتر تلگرام
             containers = build_containers(sections, has_media_caption=True)
             caption_for_media = containers[0] if containers else ""
             remaining_messages = containers[1:] if len(containers) > 1 else []
 
-            # ۸. ارسال ویدیو به تلگرام
+            # ۹. آپلود و ارسال ویدیو
             await dbg.step("Upload Video to Telegram")
             await update_status("در حال آپلود و ارسال ویدیو به تلگرام...")
             with open(downloaded_file, "rb") as vf:
@@ -637,12 +660,11 @@ async def process_and_send(chat_id: int, url: str):
                 if tf:
                     tf.close()
 
-                # اگر ارسال ویدیو با کپشن به دلیل ارور تلگرام رد شد، ویدیو بدون کپشن ارسال شده و کل متن جدا ارسال می‌شود
                 if send_resp.status_code != 200:
                     await client.post(f"{TELEGRAM_API}/sendVideo", data={"chat_id": chat_id, "supports_streaming": "true"}, files=files, timeout=300.0)
                     remaining_messages = containers
 
-            # ۹. ارسال بخش‌های اضافه متن در صورت طولانی بودن
+            # ۱۰. ارسال پیام‌های تکمیلی در صورت طولانی بودن متن
             for extra_msg in remaining_messages:
                 await client.post(f"{TELEGRAM_API}/sendMessage", json={
                     "chat_id": chat_id,
@@ -651,7 +673,7 @@ async def process_and_send(chat_id: int, url: str):
                     "link_preview_options": {"is_disabled": True}
                 }, timeout=30.0)
 
-            # ۱۰. حذف پیام وضعیت و اتمام کار
+            # ۱۱. حذف پیام وضعیت موقت
             if status_msg_id:
                 await client.post(f"{TELEGRAM_API}/deleteMessage", json={"chat_id": chat_id, "message_id": status_msg_id})
             await dbg.end(True)
