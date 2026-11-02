@@ -496,7 +496,7 @@ def build_footer(info: dict, post_url: str, lang: str, target: str, translated: 
     lines.append(f"<b>Processing:</b> {total_sec:.1f}s")
     return "\n" + "\n".join(lines)
 
-# ======================= ارسال ایمن مدیا به تلگرام =======================
+# ======================= سیستم نجات ۴ مرحله‌ای ارسال ویدیو =======================
 async def send_video_robust(
     client: httpx.AsyncClient,
     chat_id: int,
@@ -505,54 +505,94 @@ async def send_video_robust(
     caption: str = "",
     width: Optional[int] = None,
     height: Optional[int] = None,
-    duration: Optional[int] = None
-) -> Tuple[bool, httpx.Response]:
-    data = {
-        "chat_id": chat_id,
+    duration: Optional[int] = None,
+    dbg: Optional[DebugLogger] = None
+) -> Tuple[bool, Optional[str]]:
+    
+    # بررسی حجم فایل برای سقف ۵۰ مگابایت تلگرام
+    actual_video_path = video_path
+    comp_file = None
+    try:
+        file_size = os.path.getsize(video_path)
+        if file_size > 49 * 1024 * 1024:
+            if dbg: await dbg.step("فشرده‌سازی ویدیوی بالای ۵۰ مگابایت")
+            comp_file = f"{video_path}_comp.mp4"
+            cmd_comp = f'ffmpeg -y -i "{video_path}" -c:v libx264 -crf 28 -preset fast -c:a aac -b:a 96k "{comp_file}"'
+            subprocess.run(cmd_comp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(comp_file) and os.path.getsize(comp_file) > 1000:
+                actual_video_path = comp_file
+    except Exception:
+        pass
+
+    # اعتبارسنجی تامبنیل تلگرام (فرمت JPEG، کمتر از ۲۰۰ کیلوبایت)
+    valid_thumb = (
+        thumb_path is not None and 
+        os.path.exists(thumb_path) and 
+        (100 < os.path.getsize(thumb_path) < 200 * 1024)
+    )
+
+    base_data = {
+        "chat_id": str(chat_id),
         "supports_streaming": "true"
     }
+    if width and int(width) > 0:
+        base_data["width"] = str(int(width))
+    if height and int(height) > 0:
+        base_data["height"] = str(int(height))
+    if duration and int(duration) > 0:
+        base_data["duration"] = str(int(duration))
+
+    async def _post_media(endpoint: str, post_data: dict, use_thumb: bool, file_field: str = "video"):
+        with open(actual_video_path, "rb") as vf:
+            files = {file_field: (os.path.basename(actual_video_path), vf, "video/mp4")}
+            if use_thumb and valid_thumb:
+                with open(thumb_path, "rb") as tf:
+                    files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+                    return await client.post(f"{TELEGRAM_API}/{endpoint}", data=post_data, files=files, timeout=300.0)
+            else:
+                return await client.post(f"{TELEGRAM_API}/{endpoint}", data=post_data, files=files, timeout=300.0)
+
+    # مرحله ۱: ارسال ویدیو همراه با کپشن و تامبنیل
+    data_with_caption = dict(base_data)
     if caption:
-        data["caption"] = caption
-        data["parse_mode"] = "HTML"
-    if width:
-        data["width"] = width
-    if height:
-        data["height"] = height
-    if duration:
-        data["duration"] = duration
+        data_with_caption["caption"] = caption
+        data_with_caption["parse_mode"] = "HTML"
 
-    # تلاش اول: ارسال با کپشن و تامبنیل
-    with open(video_path, "rb") as vf:
-        files = {"video": (os.path.basename(video_path), vf, "video/mp4")}
-        if thumb_path and os.path.exists(thumb_path):
-            with open(thumb_path, "rb") as tf:
-                files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
-                resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
-        else:
-            resp = await client.post(f"{TELEGRAM_API}/sendVideo", data=data, files=files, timeout=300.0)
-
+    resp = await _post_media("sendVideo", data_with_caption, use_thumb=True)
     if resp.status_code == 200:
-        return True, resp
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return True, None
+    if dbg: await dbg.err("sendVideo (با کپشن و تامبنیل) شکست خورد", resp.text[:200])
 
-    # تلاش دوم (در صورت رد شدن کپشن توسط تلگرام): ارسال فایل بدون کپشن
-    fallback_data = {
-        "chat_id": chat_id,
-        "supports_streaming": "true"
-    }
-    if width: fallback_data["width"] = width
-    if height: fallback_data["height"] = height
-    if duration: fallback_data["duration"] = duration
+    # مرحله ۲: ارسال ویدیو با کپشن اما بدون تامبنیل (در صورتی که خطای تامبنیل باشد)
+    resp = await _post_media("sendVideo", data_with_caption, use_thumb=False)
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return True, None
+    if dbg: await dbg.err("sendVideo (با کپشن، بدون تامبنیل) شکست خورد", resp.text[:200])
 
-    with open(video_path, "rb") as vf:
-        files = {"video": (os.path.basename(video_path), vf, "video/mp4")}
-        if thumb_path and os.path.exists(thumb_path):
-            with open(thumb_path, "rb") as tf:
-                files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
-                resp_retry = await client.post(f"{TELEGRAM_API}/sendVideo", data=fallback_data, files=files, timeout=300.0)
-        else:
-            resp_retry = await client.post(f"{TELEGRAM_API}/sendVideo", data=fallback_data, files=files, timeout=300.0)
+    # مرحله ۳: ارسال ویدیو خام (بدون کپشن و تامبنیل - متن‌ها در پیام بعدی ارسال خواهند شد)
+    resp = await _post_media("sendVideo", base_data, use_thumb=False)
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return False, None
+    if dbg: await dbg.err("sendVideo (ویدیو خام) شکست خورد", resp.text[:200])
 
-    return False, resp_retry
+    # مرحله ۴: ارسال فایل ویدیو به عنوان داکیومنت (در صورتی که کدک یا ساختار پلیر رد شده باشد)
+    doc_data = {"chat_id": str(chat_id)}
+    resp = await _post_media("sendDocument", doc_data, use_thumb=False, file_field="document")
+    if resp.status_code == 200:
+        if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+        return False, None
+    if dbg: await dbg.err("sendDocument شکست خورد", resp.text[:200])
+
+    # اگر تمام ۴ مرحله شکست خورد، خطای دقیق تلگرام را استخراج کن
+    if comp_file and os.path.exists(comp_file): os.remove(comp_file)
+    try:
+        err_desc = resp.json().get("description", resp.text[:200])
+    except Exception:
+        err_desc = resp.text[:200]
+    return False, err_desc
 
 # ======================= چرخه کامل دانلود، پردازش و ارسال =======================
 async def process_and_send(chat_id: int, url: str):
@@ -688,11 +728,11 @@ async def process_and_send(chat_id: int, url: str):
             caption_for_media = containers[0] if containers else ""
             remaining_messages = containers[1:] if len(containers) > 1 else []
 
-            # ۹. آپلود و ارسال ویدیو به صورت ایمن
+            # ۹. آپلود و ارسال ویدیو با سیستم نجات چندمرحله‌ای
             await dbg.step("Upload Video to Telegram")
             await update_status("در حال آپلود و ارسال ویدیو به تلگرام...")
             
-            success_with_caption, _ = await send_video_robust(
+            sent_with_caption, err_msg = await send_video_robust(
                 client=client,
                 chat_id=chat_id,
                 video_path=downloaded_file,
@@ -700,21 +740,43 @@ async def process_and_send(chat_id: int, url: str):
                 caption=caption_for_media,
                 width=info.get('width'),
                 height=info.get('height'),
-                duration=int(info['duration']) if info.get('duration') else None
+                duration=int(info['duration']) if info.get('duration') else None,
+                dbg=dbg
             )
 
-            # اگر ارسال با کپشن ناموفق بود و ویدیو خام ارسال شد، کل متن‌ها به صورت پیام متنی ارسال می‌شوند
-            if not success_with_caption:
-                remaining_messages = containers
-
-            # ۱۰. ارسال پیام‌های تکمیلی
-            for extra_msg in remaining_messages:
+            # ۱۰. ارسال پیام‌های تکمیلی متنی بر اساس وضعیت ویدیو
+            if sent_with_caption:
+                # ویدیو همراه با کپشن اصلی فرستاده شد؛ بقیه بخش‌ها را بفرست
+                for extra_msg in remaining_messages:
+                    await client.post(f"{TELEGRAM_API}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": extra_msg,
+                        "parse_mode": "HTML",
+                        "link_preview_options": {"is_disabled": True}
+                    }, timeout=30.0)
+            elif err_msg is None:
+                # ویدیو به صورت خام با موفقیت ارسال شد؛ تمام متن‌ها را به عنوان پیام‌های متصل بفرست
+                for msg_chunk in containers:
+                    await client.post(f"{TELEGRAM_API}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": msg_chunk,
+                        "parse_mode": "HTML",
+                        "link_preview_options": {"is_disabled": True}
+                    }, timeout=30.0)
+            else:
+                # اگر تلگرام کلاً ارسال فایل را نپذیرفت، خطای تلگرام را به کاربر نشان بده
                 await client.post(f"{TELEGRAM_API}/sendMessage", json={
                     "chat_id": chat_id,
-                    "text": extra_msg,
-                    "parse_mode": "HTML",
-                    "link_preview_options": {"is_disabled": True}
+                    "text": f"⚠️ ویدیو به دلیل خطای تلگرام ارسال نشد:\n<code>{html.escape(err_msg)}</code>\n\nمتن استخراج‌شده در ادامه ارسال می‌شود:",
+                    "parse_mode": "HTML"
                 }, timeout=30.0)
+                for msg_chunk in containers:
+                    await client.post(f"{TELEGRAM_API}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": msg_chunk,
+                        "parse_mode": "HTML",
+                        "link_preview_options": {"is_disabled": True}
+                    }, timeout=30.0)
 
             # ۱۱. حذف پیام وضعیت موقت
             if status_msg_id:
