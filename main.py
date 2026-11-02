@@ -21,7 +21,7 @@ CONFIG = {
         k.strip() for k in os.getenv("GEMINI_KEYS", "").split(",") if k.strip()
     ],
     "DEBUG_CHAT_ID": os.getenv("DEBUG_CHAT_ID", ""),
-    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+    "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
     "TRANSLATE_TO": os.getenv("TRANSLATE_TO", "fa"),
 }
 
