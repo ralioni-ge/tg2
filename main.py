@@ -21,7 +21,11 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 async def send_msg(client, chat_id, text):
     try:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15.0)
+        await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=15.0
+        )
     except Exception:
         pass
 
@@ -94,20 +98,17 @@ async def process_and_send(chat_id, url):
                 
                 caption = format_caption(info, url)
                 
-                # استخراج ابعاد و طول واقعی ویدیو
                 video_width = info.get('width')
                 video_height = info.get('height')
                 duration = int(info.get('duration') or 0)
 
-            # ساخت تامبنیل بدون دفرمه شدن:
-            # اگر افقی باشد عرض ۳۲۰ می‌شود، اگر عمودی باشد ارتفاع ۳۲۰ می‌شود (سقف مجاز تلگرام حفظ می‌شود)
+            # ساخت تامبنیل با حفظ کامل نسبت ابعاد (Aspect Ratio) بدون دفرمه شدن
             cmd = (
                 f'ffmpeg -y -ss 00:00:00.500 -i "{downloaded_file}" -vframes 1 '
                 f'-vf "scale=\'if(gt(a,1),320,-2)\':\'if(gt(a,1),-2,320)\'" -q:v 2 "{thumb_path}"'
             )
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # ارسال ویدیو به تلگرام با ابعاد دقیق
             with open(downloaded_file, "rb") as vf:
                 filename = os.path.basename(downloaded_file)
                 files = {"video": (filename, vf, "video/mp4")}
@@ -124,7 +125,6 @@ async def process_and_send(chat_id, url):
                     "supports_streaming": "true"
                 }
 
-                # اضافه کردن ابعاد دقیق برای جلوگیری از دفرمه شدن پلیر
                 if video_width:
                     data["width"] = video_width
                 if video_height:
@@ -172,4 +172,21 @@ async def telegram_worker():
                         if not chat_id or not text:
                             continue
 
-     
+                        if text == "/start":
+                            await send_msg(client, chat_id, "سلام! ربات فعال است. لینک ریلز بفرستید.")
+                            continue
+
+                        match = re.search(r"https?://(?:www\.)?instagram\.com/(?:p|reel|tv)/[a-zA-Z0-9_\-]+", text)
+                        if match:
+                            asyncio.create_task(process_and_send(chat_id, match.group(0)))
+            except Exception:
+                await asyncio.sleep(2)
+
+def run_bot():
+    asyncio.run(telegram_worker())
+
+threading.Thread(target=run_bot, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
